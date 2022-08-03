@@ -33,7 +33,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch import Tensor
-
+import torch.nn.functional as F
+from functools import partial
 
 def aggregate_residual(feats1, feats2, method: str):
     """ Add or concatenate two fiber features together. If degrees don't match, will use the ones of feats2. """
@@ -128,3 +129,26 @@ def rank_zero_only(fn):
 def using_tensor_cores(amp: bool) -> bool:
     major_cc, minor_cc = torch.cuda.get_device_capability()
     return (amp and major_cc >= 7) or major_cc >= 8
+
+def sce_loss(x, y, alpha=3):
+    x = F.normalize(x, p=2, dim=-1)
+    y = F.normalize(y, p=2, dim=-1)
+
+    # loss =  - (x * y).sum(dim=-1)
+    # loss = (x_h - y_h).norm(dim=1).pow(alpha)
+
+    loss = (1 - (x * y).sum(dim=-1)).pow_(alpha)
+
+    loss = loss.mean()
+    return loss
+
+def get_loss_function(name):
+    # get the training objective
+    if name == 'sce':
+        return partial(sce_loss, alpha=2)
+    elif name == 'mse':
+        return torch.nn.MSELoss()
+    elif name == 'mae':
+        return torch.nn.L1Loss()
+    else:
+        raise NotImplementedError

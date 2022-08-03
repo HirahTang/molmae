@@ -45,10 +45,13 @@ def _get_relative_pos(qm9_graph: DGLGraph) -> Tensor:
 
 def _get_split_sizes(full_dataset: Dataset) -> Tuple[int, int, int]:
     len_full = len(full_dataset)
-    len_train = 100_000
-    len_test = int(0.1 * len_full)
-    len_val = len_full - len_train - len_test
-    return len_train, len_val, len_test
+    # len_train = 100_000
+    # len_test = int(0.1 * len_full)
+    # len_val = len_full - len_train - len_test
+    # return len_train, len_val, len_test
+    len_val = int(0.1 * len_full)
+    len_train = len_full - len_val
+    return  len_train, len_val, 0
 
 
 class QM9DataModule(DataModule):
@@ -91,6 +94,7 @@ class QM9DataModule(DataModule):
         train_targets = full_dataset.targets[self.ds_train.indices, full_dataset.label_keys[0]]
         self.targets_mean = train_targets.mean()
         self.targets_std = train_targets.std()
+        self.full_dataset = full_dataset
 
     def prepare_data(self):
         # Download the QM9 preprocessed data
@@ -123,7 +127,7 @@ class QM9DataModule(DataModule):
                             choices=['mu', 'alpha', 'homo', 'lumo', 'gap', 'r2', 'zpve', 'U0', 'U', 'H', 'G', 'Cv',
                                      'U0_atom', 'U_atom', 'H_atom', 'G_atom', 'A', 'B', 'C'],
                             help='Regression task to train on')
-        parser.add_argument('--precompute_bases', type=str2bool, nargs='?', const=True, default=False,
+        parser.add_argument('--precompute_bases', type=str2bool, nargs='?', const=False, default=False,
                             help='Precompute bases at the beginning of the script during dataset initialization,'
                                  ' instead of computing them at the beginning of each forward pass.')
         return parent_parser

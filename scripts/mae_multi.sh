@@ -1,0 +1,1 @@
+python -m torch.distributed.run --nnodes=1 --nproc_per_node=2 --module se3_transformer.run_mae.training --amp true  --batch_size 240 --epochs 5 --lr 0.002 --weight_decay 0.1 --use_layer_norm --norm --save_ckpt_path model_qm9.pth --precompute_bases --seed 42 --task homo --wandb y --ckpt_interval 50 --eval_interval 1 --exp_name nodeonly_801

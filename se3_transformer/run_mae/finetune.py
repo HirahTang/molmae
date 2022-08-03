@@ -199,7 +199,7 @@ if __name__ == '__main__':
     logging.getLogger().setLevel(logging.CRITICAL if local_rank != 0 or args.silent else logging.INFO)
 
     logging.info('====== SE(3)-Transformer ======')
-    logging.info('|      Training procedure     |')
+    logging.info('|      Finetune procedure     |')
     logging.info('===============================')
 
     if args.seed is not None:
@@ -208,7 +208,7 @@ if __name__ == '__main__':
 
     loggers = [DLLogger(save_dir=args.log_dir, filename=args.dllogger_name)]
     if args.wandb:
-        loggers.append(WandbLogger(name=f'QM9({args.task})', save_dir=args.log_dir, project='se3-transformer'))
+        loggers.append(WandbLogger(name=f'QM9({args.task})', save_dir=args.log_dir, project='finetune'))
     logger = LoggerCollection(loggers)
 
     datamodule = QM9DataModule(**vars(args))
@@ -220,6 +220,28 @@ if __name__ == '__main__':
         tensor_cores=using_tensor_cores(args.amp),  # use Tensor Cores more effectively
         **vars(args)
     )
+    model_state_dict = model.state_dict()
+    if args.load_ckpt_path is not None:
+        checkpoint = torch.load(str(args.load_ckpt_path), map_location={'cuda:0': f'cuda:{local_rank}'})
+        loaded_state_dict = checkpoint['state_dict']
+        pretrained_state_dict = {}
+        for param_name in loaded_state_dict.keys():
+            new_param_name = param_name
+            if new_param_name not in model_state_dict:
+                print(f'Pretrained parameter "{param_name}" cannot be found in model parameters.')
+            elif model_state_dict[new_param_name].shape != loaded_state_dict[param_name].shape:
+                print(f'Pretrained parameter "{param_name}" '
+                    f'of shape {loaded_state_dict[param_name].shape} does not match corresponding '
+                    f'model parameter of shape {model_state_dict[new_param_name].shape}.')
+            else:
+                print(f'Loading pretrained parameter "{param_name}".')
+                pretrained_state_dict[new_param_name] = loaded_state_dict[param_name]
+        # Load pretrained weights
+        model_state_dict.update(pretrained_state_dict)
+        model.load_state_dict(model_state_dict)
+    for param in model.transformer.parameters():
+        param.requires_grad = False
+
     loss_fn = nn.L1Loss()
 
     if args.benchmark:
@@ -244,4 +266,4 @@ if __name__ == '__main__':
           logger,
           args)
 
-    logging.info('Training finished successfully')
+    logging.info('Finetuning finished successfully')

@@ -25,7 +25,7 @@ import argparse
 import pathlib
 
 from se3_transformer.data_loading import QM9DataModule
-from se3_transformer.model import SE3TransformerPooled
+from se3_transformer.model import SE3Transformer
 from se3_transformer.runtime.utils import str2bool
 
 PARSER = argparse.ArgumentParser(description='SE(3)-Transformer')
@@ -64,9 +64,12 @@ PARSER.add_argument('--silent', type=str2bool, nargs='?', const=True, default=Fa
                     help='Minimize stdout output')
 PARSER.add_argument('--wandb', type=str2bool, nargs='?', const=True, default=False,
                     help='Enable W&B logging')
+PARSER.add_argument('--exp_name', type=str, default='Trial', help='Experiment name.')
 
 PARSER.add_argument('--benchmark', type=str2bool, nargs='?', const=True, default=False,
                     help='Benchmark mode')
+PARSER.add_argument('--loss_type', type=str, default='sce', help='The optimization function of MAE.')
+PARSER.add_argument('--evaluate', type=str2bool, nargs='?', const=True, default=False, help='Whether to evaluate the pretrained model on the task set.')
 
 QM9DataModule.add_argparse_args(PARSER)
-SE3TransformerPooled.add_argparse_args(PARSER)
+SE3Transformer.add_argparse_args(PARSER)

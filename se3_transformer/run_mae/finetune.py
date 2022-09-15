@@ -208,7 +208,7 @@ if __name__ == '__main__':
 
     loggers = [DLLogger(save_dir=args.log_dir, filename=args.dllogger_name)]
     if args.wandb:
-        loggers.append(WandbLogger(name=f'QM9({args.task})', save_dir=args.log_dir, project='finetune'))
+        loggers.append(WandbLogger(name=args.exp_name, save_dir=args.log_dir, project='finetune'))
     logger = LoggerCollection(loggers)
 
     datamodule = QM9DataModule(**vars(args))
@@ -221,26 +221,30 @@ if __name__ == '__main__':
         **vars(args)
     )
     model_state_dict = model.state_dict()
-    if args.load_ckpt_path is not None:
-        checkpoint = torch.load(str(args.load_ckpt_path), map_location={'cuda:0': f'cuda:{local_rank}'})
+
+    assert args.load_ckpt_path == None, "Require the pretrained model path!"
+    if args.load_ptm_path is not None:
+        checkpoint = torch.load(str(args.load_ptm_path), map_location={'cuda:0': f'cuda:{local_rank}'})
         loaded_state_dict = checkpoint['state_dict']
         pretrained_state_dict = {}
         for param_name in loaded_state_dict.keys():
             new_param_name = param_name
-            if new_param_name not in model_state_dict:
-                print(f'Pretrained parameter "{param_name}" cannot be found in model parameters.')
-            elif model_state_dict[new_param_name].shape != loaded_state_dict[param_name].shape:
-                print(f'Pretrained parameter "{param_name}" '
-                    f'of shape {loaded_state_dict[param_name].shape} does not match corresponding '
-                    f'model parameter of shape {model_state_dict[new_param_name].shape}.')
-            else:
-                print(f'Loading pretrained parameter "{param_name}".')
-                pretrained_state_dict[new_param_name] = loaded_state_dict[param_name]
+            if local_rank == 0:
+                if new_param_name not in model_state_dict:
+                    print(f'Pretrained parameter "{param_name}" cannot be found in model parameters.')
+                elif model_state_dict[new_param_name].shape != loaded_state_dict[param_name].shape:
+                    print(f'Pretrained parameter "{param_name}" '
+                        f'of shape {loaded_state_dict[param_name].shape} does not match corresponding '
+                        f'model parameter of shape {model_state_dict[new_param_name].shape}.')
+                else:
+                    print(f'Loading pretrained parameter "{param_name}".')
+                    pretrained_state_dict[new_param_name] = loaded_state_dict[param_name]
         # Load pretrained weights
         model_state_dict.update(pretrained_state_dict)
         model.load_state_dict(model_state_dict)
-    for param in model.transformer.parameters():
-        param.requires_grad = False
+    if args.finetune_freeze:
+        for param in model.transformer.parameters():
+            param.requires_grad = False
 
     loss_fn = nn.L1Loss()
 
@@ -265,5 +269,19 @@ if __name__ == '__main__':
           callbacks,
           logger,
           args)
+
+    if is_distributed:
+        affinity = gpu_affinity.set_affinity(gpu_id=get_local_rank(), nproc_per_node=torch.cuda.device_count())
+        model = DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank)
+        model._set_static_graph()
+
+    logging.info('Run evaluation on test set.')
+    evaluate(model,
+             datamodule.test_dataloader(),
+             callbacks,
+             args)
+
+    for callback in callbacks:
+        callback.on_validation_end()
 
     logging.info('Finetuning finished successfully')

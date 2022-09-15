@@ -20,7 +20,9 @@
 #
 # SPDX-FileCopyrightText: Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES
 # SPDX-License-Identifier: MIT
+from ast import Assign
 from typing import Tuple
+from cv2 import split
 
 import dgl
 import pathlib
@@ -35,6 +37,7 @@ from se3_transformer.data_loading.data_module import DataModule
 from se3_transformer.model.basis import get_basis
 from se3_transformer.runtime.utils import get_local_rank, str2bool, using_tensor_cores
 
+from se3_transformer.run_mae.utils import assign_neighborhoods, ground_truth_local_stats
 
 def _get_relative_pos(qm9_graph: DGLGraph) -> Tensor:
     x = qm9_graph.ndata['pos']
@@ -43,15 +46,20 @@ def _get_relative_pos(qm9_graph: DGLGraph) -> Tensor:
     return rel_pos
 
 
-def _get_split_sizes(full_dataset: Dataset) -> Tuple[int, int, int]:
+def _get_split_sizes(full_dataset: Dataset, split_size_type: str) -> Tuple[int, int, int]:
     len_full = len(full_dataset)
-    # len_train = 100_000
-    # len_test = int(0.1 * len_full)
-    # len_val = len_full - len_train - len_test
-    # return len_train, len_val, len_test
-    len_val = int(0.1 * len_full)
-    len_train = len_full - len_val
-    return  len_train, len_val, 0
+    if split_size_type == 'pretrain':
+        len_val = int(0.1 * len_full)
+        len_train = len_full - len_val
+        # return len_full-len_val, len_val, 0
+        return len_train, len_val, 0
+    elif split_size_type == 'finetune':
+        len_train = 100_000
+        len_test = int(0.1 * len_full)
+        len_val = len_full - len_train - len_test
+        return len_train, len_val, len_test
+    else:
+        raise NotImplementedError
 
 
 class QM9DataModule(DataModule):
@@ -88,7 +96,7 @@ class QM9DataModule(DataModule):
         else:
             full_dataset = QM9EdgeDataset(**qm9_kwargs)
 
-        self.ds_train, self.ds_val, self.ds_test = random_split(full_dataset, _get_split_sizes(full_dataset),
+        self.ds_train, self.ds_val, self.ds_test = random_split(full_dataset, _get_split_sizes(full_dataset, kwargs['split_size_type']),
                                                                 generator=torch.Generator().manual_seed(0))
 
         train_targets = full_dataset.targets[self.ds_train.indices, full_dataset.label_keys[0]]
@@ -175,3 +183,98 @@ class CachedBasesQM9EdgeDataset(QM9EdgeDataset):
                                   self.bases[bases_idx].items()}
         else:
             return graph, label
+
+
+
+
+class QM9MAEModule(DataModule):
+    """
+    Datamodule wrapping https://docs.dgl.ai/en/latest/api/python/dgl.data.html#qm9edge-dataset
+    Training set is 100k molecules. Test set is 10% of the dataset. Validation set is the rest.
+    This includes all the molecules from QM9 except the ones that are uncharacterized.
+    Specify the collate module to generate labels for pretraining.
+    """
+
+    NODE_FEATURE_DIM = 6
+    EDGE_FEATURE_DIM = 4
+
+    def __init__(self,
+                 data_dir: pathlib.Path,
+                 task: str = 'homo',
+                 batch_size: int = 240,
+                 num_workers: int = 8,
+                 num_degrees: int = 4,
+                 amp: bool = False,
+                 precompute_bases: bool = False,
+                 **kwargs):
+        self.data_dir = data_dir  # This needs to be before __init__ so that prepare_data has access to it
+        super().__init__(batch_size=batch_size, num_workers=num_workers, collate_fn=self._collate)
+        self.amp = amp
+        self.task = task
+        self.batch_size = batch_size
+        self.num_degrees = num_degrees
+
+        qm9_kwargs = dict(label_keys=[self.task], verbose=False, raw_dir=str(data_dir))
+        if precompute_bases:
+            bases_kwargs = dict(max_degree=num_degrees - 1, use_pad_trick=using_tensor_cores(amp), amp=amp)
+            full_dataset = CachedBasesQM9EdgeDataset(bases_kwargs=bases_kwargs, batch_size=batch_size,
+                                                     num_workers=num_workers, **qm9_kwargs)
+        else:
+            full_dataset = QM9EdgeDataset(**qm9_kwargs)
+
+        self.ds_train, self.ds_val, self.ds_test = random_split(full_dataset, _get_split_sizes(full_dataset, kwargs['split_size_type']),
+                                                                generator=torch.Generator().manual_seed(0))
+
+        train_targets = full_dataset.targets[self.ds_train.indices, full_dataset.label_keys[0]]
+        self.targets_mean = train_targets.mean()
+        self.targets_std = train_targets.std()
+        self.full_dataset = full_dataset
+        self.prepare_pretrain = kwargs['prepare_pretrain']
+
+    def prepare_data(self):
+        # Download the QM9 preprocessed data
+        QM9EdgeDataset(verbose=True, raw_dir=str(self.data_dir))
+
+    def _collate(self, samples):
+        graphs, y, *bases = map(list, zip(*samples))
+        batched_graph = dgl.batch(graphs)
+        edge_feats = {'0': batched_graph.edata['edge_attr'][..., None]}
+        batched_graph.edata['rel_pos'] = _get_relative_pos(batched_graph)
+        # get node features
+        node_feats = {'0': batched_graph.ndata['attr'][:, :6, None]}
+        targets = (torch.cat(y) - self.targets_mean) / self.targets_std
+
+
+        if self.prepare_pretrain:
+            # calculate pretrain labels
+            # get neighbors for each node, then calculate corresponding bond length and bond angle
+            neighbors, neighbor_masks = assign_neighborhoods(batched_graph)
+
+            bond_length, bond_angle = ground_truth_local_stats(batched_graph.ndata['pos'], neighbors, neighbor_masks)
+            
+            # the orientation and the radius for each node 
+        if bases:
+            # collate bases
+            all_bases = {
+                key: torch.cat([b[key] for b in bases[0]], dim=0)
+                for key in bases[0][0].keys()
+            }
+        
+            return batched_graph, node_feats, edge_feats, all_bases, targets, neighbors, bond_length, bond_angle
+        else:
+            return batched_graph, node_feats, edge_feats, targets, bond_length, bond_angle
+
+    @staticmethod
+    def add_argparse_args(parent_parser):
+        parser = parent_parser.add_argument_group("QM9 dataset")
+        parser.add_argument('--task', type=str, default='homo', const='homo', nargs='?',
+                            choices=['mu', 'alpha', 'homo', 'lumo', 'gap', 'r2', 'zpve', 'U0', 'U', 'H', 'G', 'Cv',
+                                     'U0_atom', 'U_atom', 'H_atom', 'G_atom', 'A', 'B', 'C'],
+                            help='Regression task to train on')
+        parser.add_argument('--precompute_bases', type=str2bool, nargs='?', const=False, default=False,
+                            help='Precompute bases at the beginning of the script during dataset initialization,'
+                                 ' instead of computing them at the beginning of each forward pass.')
+        return parent_parser
+
+    def __repr__(self):
+        return f'QM9({self.task})'

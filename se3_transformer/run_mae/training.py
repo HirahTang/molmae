@@ -1,5 +1,6 @@
 import logging
 import pathlib
+from random import vonmisesvariate
 from typing import List
 
 import numpy as np
@@ -17,8 +18,8 @@ from tqdm import tqdm
 import sys
 sys.path.append('/home/sunyuancheng/molmae')
 
-from se3_transformer.data_loading import QM9DataModule
-from se3_transformer.model.mae import base_MAE
+from se3_transformer.data_loading import QM9DataModule, QM9MAEModule
+from se3_transformer.model.mae import base_MAE, egnn_MAE
 from se3_transformer.model.fiber import Fiber
 from se3_transformer.runtime import gpu_affinity
 from se3_transformer.runtime.arguments import PARSER
@@ -28,7 +29,8 @@ from se3_transformer.runtime.loggers import LoggerCollection, DLLogger, WandbLog
 from se3_transformer.runtime.utils import to_cuda, get_local_rank, init_distributed, seed_everything, \
     using_tensor_cores, increase_l2_fetch_granularity, get_loss_function
 from se3_transformer.runtime.training import load_state, save_state
-from se3_transformer.run_mae.finetune import evaluate
+from se3_transformer.runtime.utils import str2bool
+from se3_transformer.run_mae.utils import von_Mises_loss
 
 
 def print_parameters_count(model):
@@ -113,14 +115,21 @@ def train_epoch(model, train_dataloader, loss_fn, epoch_idx, grad_scaler, optimi
     for i, batch in tqdm(enumerate(train_dataloader), total=len(train_dataloader), unit='batch',
                          desc=f'Epoch {epoch_idx}', disable=(args.silent or local_rank != 0)):
         # *inputs, target = to_cuda(batch)
-        *inputs, _ = to_cuda(batch)
+        *inputs, _, bond_length_truth, bond_angle_truth = to_cuda(batch)
+        batched_graph = inputs[0]
 
         for callback in callbacks:
             callback.on_batch_start()
 
         with torch.cuda.amp.autocast(enabled=args.amp):
-            target, recon = model(*inputs)
-            loss = loss_fn(recon, target) / args.accumulate_grad_batches
+            # bond_length_pred, bond_angle_pred, radius_pred, orientaion_pred
+            preds = model(*inputs)
+            length_loss = loss_fn(preds[0][~batched_graph.ndata['node_mask'].bool()], bond_length_truth[~batched_graph.ndata['node_mask'].bool()])
+            angle_loss = von_Mises_loss(preds[1][~batched_graph.ndata['node_mask'].bool()], bond_angle_truth[~batched_graph.ndata['node_mask'].bool()])
+            # radius_loss = loss_fn(preds[2]*batched_graph.ndata['node_mask'])
+            # orientation_loss = loss_fn(preds[2]*batched_graph.ndata['node_mask'])
+
+            loss = (length_loss + angle_loss) / args.accumulate_grad_batches
 
         grad_scaler.scale(loss).backward()
 
@@ -164,7 +173,11 @@ def validate(model: nn.Module,
 if __name__ == '__main__':
     is_distributed = init_distributed()
     local_rank = get_local_rank()
-    base_MAE.add_argparse_args(PARSER)
+    # base_MAE.add_argparse_args(PARSER)
+    PARSER.add_argument('--mask_ratio', type=float, default=0.3, help="The mask ratio of the masked auto-encoder.")
+    PARSER.add_argument('--mask_type', choices=['rand', 'block'], default='rand', help='The mask strategy on atoms, rand or block.')
+    PARSER.add_argument('--mask_all', type=str2bool, default=False, help='If true, mask basis, node features and edge features. If false, only mask node features, may have data leakge')
+    PARSER.add_argument('--prepare_pretrain', type=str2bool, default=True, help='prepare labels for pretraining tasks')
     args = PARSER.parse_args()
 
     logging.getLogger().setLevel(logging.CRITICAL if local_rank != 0 or args.silent else logging.INFO)
@@ -182,18 +195,26 @@ if __name__ == '__main__':
         loggers.append(WandbLogger(name=args.exp_name, save_dir=args.log_dir, project='se3-mae'))
     logger = LoggerCollection(loggers)
 
-    datamodule = QM9DataModule(**vars(args))
-    model = base_MAE(
-        fiber_in=Fiber({0: datamodule.NODE_FEATURE_DIM}),
-        fiber_hidden=Fiber.create(args.num_degrees, args.num_channels),
-        fiber_out=Fiber({0: args.num_degrees * args.num_channels}),
-        fiber_edge=Fiber({0: datamodule.EDGE_FEATURE_DIM}),
-        # output_dim=datamodule.NODE_FEATURE_DIM,
-        output_dim=3,
-        tensor_cores=using_tensor_cores(args.amp),  # use Tensor Cores more effectively
-        return_type=0,
-        **vars(args)
-    )
+    datamodule = QM9MAEModule(**vars(args))
+    if args.encoder_type == 'se3':
+        model = base_MAE(
+            fiber_in=Fiber({0: datamodule.NODE_FEATURE_DIM}),
+            fiber_hidden=Fiber.create(args.num_degrees, args.num_channels),
+            # fiber_out=Fiber({0: args.num_degrees * args.num_channels}),
+            fiber_out=Fiber.create(2, args.num_degrees * args.num_channels),
+            fiber_edge=Fiber({0: datamodule.EDGE_FEATURE_DIM}),
+            # output_dim=datamodule.NODE_FEATURE_DIM+3,
+            # output_dim=3,
+            tensor_cores=using_tensor_cores(args.amp),  # use Tensor Cores more effectively
+            # return_type=0,
+            **vars(args)
+        )
+    elif args.encoder_type == 'egnn':
+        model = egnn_MAE(
+            num_node_features = datamodule.NODE_FEATURE_DIM,
+            num_edge_features = datamodule.EDGE_FEATURE_DIM,
+            **vars(args),
+        )
     loss_fn = get_loss_function(args.loss_type)
 
     # for downstream test

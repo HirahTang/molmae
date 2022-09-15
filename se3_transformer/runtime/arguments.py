@@ -41,6 +41,8 @@ paths.add_argument('--save_ckpt_path', type=pathlib.Path, default=None,
                    help='File where the checkpoint should be saved')
 paths.add_argument('--load_ckpt_path', type=pathlib.Path, default=None,
                    help='File of the checkpoint to be loaded')
+paths.add_argument('--load_ptm_path', type=pathlib.Path, default=None, 
+                   help='File of the pretrained model to finetune')
 
 optimizer = PARSER.add_argument_group('Optimizer')
 optimizer.add_argument('--optimizer', choices=['adam', 'sgd', 'lamb'], default='adam')
@@ -53,12 +55,14 @@ PARSER.add_argument('--epochs', type=int, default=100, help='Number of training 
 PARSER.add_argument('--batch_size', type=int, default=240, help='Batch size')
 PARSER.add_argument('--seed', type=int, default=None, help='Set a seed globally')
 PARSER.add_argument('--num_workers', type=int, default=8, help='Number of dataloading workers')
+PARSER.add_argument('--split_size_type', type=str, default='pretrain', choices=['pretrain', 'finetune'], help='Pretrain has the split size of 9:1, while finetune has 8:1:1.')
+PARSER.add_argument('--finetune_freeze', type=str2bool, nargs='?', const=True, default=False, help='During finetune, if freeze, only the MLP are trained.')
 
 PARSER.add_argument('--amp', type=str2bool, nargs='?', const=True, default=False, help='Use Automatic Mixed Precision')
 PARSER.add_argument('--gradient_clip', type=float, default=None, help='Clipping of the gradient norms')
 PARSER.add_argument('--accumulate_grad_batches', type=int, default=1, help='Gradient accumulation')
 PARSER.add_argument('--ckpt_interval', type=int, default=-1, help='Save a checkpoint every N epochs')
-PARSER.add_argument('--eval_interval', dest='eval_interval', type=int, default=20,
+PARSER.add_argument('--eval_interval', dest='eval_interval', type=int, default=10,
                     help='Do an evaluation round every N epochs')
 PARSER.add_argument('--silent', type=str2bool, nargs='?', const=True, default=False,
                     help='Minimize stdout output')
@@ -69,7 +73,8 @@ PARSER.add_argument('--exp_name', type=str, default='Trial', help='Experiment na
 PARSER.add_argument('--benchmark', type=str2bool, nargs='?', const=True, default=False,
                     help='Benchmark mode')
 PARSER.add_argument('--loss_type', type=str, default='sce', help='The optimization function of MAE.')
-PARSER.add_argument('--evaluate', type=str2bool, nargs='?', const=True, default=False, help='Whether to evaluate the pretrained model on the task set.')
+PARSER.add_argument('--local_rank', type=int, default=0)
+PARSER.add_argument('--encoder_type', type=str, choices=['egnn', 'se3'], default='se3', help='The backbone model of the encoder.')
 
 QM9DataModule.add_argparse_args(PARSER)
 SE3Transformer.add_argparse_args(PARSER)

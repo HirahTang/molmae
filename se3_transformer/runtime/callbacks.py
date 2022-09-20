@@ -28,6 +28,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+from se3_transformer.runtime.metrics import Identity
 
 from se3_transformer.runtime.loggers import Logger
 from se3_transformer.runtime.metrics import MeanAbsoluteError
@@ -46,7 +47,7 @@ class BaseCallback(ABC):
     def on_batch_start(self):
         pass
 
-    def on_validation_step(self, input, target, pred):
+    def on_validation_step(self, loss):
         pass
 
     def on_validation_end(self, epoch=None):
@@ -172,3 +173,33 @@ class PerformanceCallback(BaseCallback):
             stats.update({f"latency_{self.mode}_{level}": np.percentile(deltas, level)})
 
         return stats
+
+
+class PretrainLossCallback(BaseCallback):
+    """ Logs the rescaled mean absolute error for QM9 regression tasks """
+
+    def __init__(self, logger, prefix=''):
+        self.identity = Identity()
+        self.logger = logger
+        self.prefix = prefix
+        self.best_loss = float('inf')
+        self.last_loss = None
+
+        self.logger.log_metadata(f'{self.prefix} Loss', {'unit': None})
+        self.logger.log_metadata(f'{self.prefix} best Loss', {'unit': None})
+
+    def on_validation_step(self, loss):
+        self.identity(loss)
+
+    def on_validation_end(self, epoch=None):
+        loss = self.identity.compute()
+        logging.info(f'{self.prefix} Loss: {loss}')
+        self.logger.log_metrics({f'{self.prefix} Loss': loss}, epoch)
+        self.best_mae = min(self.best_loss, loss)
+        self.last_mae = loss
+
+    def on_fit_end(self):
+        if self.best_loss != float('inf'):
+            self.logger.log_metrics({f'{self.prefix} Best Loss': self.best_loss})
+            self.logger.log_metrics({f'{self.prefix} Loss': self.last_loss})
+

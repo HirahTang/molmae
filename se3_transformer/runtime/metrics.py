@@ -81,3 +81,18 @@ class MeanAbsoluteError(Metric):
 
     def _compute(self):
         return self.error / self.total
+
+
+class Identity(Metric):
+    def __init__(self):
+        super().__init__()
+        self.add_state('error', torch.tensor(0, dtype=torch.float32, device='cuda'))
+        self.add_state('total', torch.tensor(0, dtype=torch.int32, device='cuda'))
+
+    def update(self, loss: Tensor):
+        loss = loss.detach()
+        self.total += 1
+        self.error += loss
+
+    def _compute(self):
+        return self.error / self.total

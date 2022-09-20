@@ -75,6 +75,8 @@ def to_cuda(x):
         return [to_cuda(v) for v in x]
     elif isinstance(x, dict):
         return {k: to_cuda(v) for k, v in x.items()}
+    elif x == None:
+        return None
     else:
         # DGLGraph or other objects
         return x.to(device=torch.cuda.current_device())

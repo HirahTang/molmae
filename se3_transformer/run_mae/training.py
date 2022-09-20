@@ -14,16 +14,17 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
+from rdkit import RDLogger
 
 import sys
 sys.path.append('/home/sunyuancheng/molmae')
 
-from se3_transformer.data_loading import QM9DataModule, QM9MAEModule
+from se3_transformer.data_loading import QM9DataModule, QM9MAEModule, OGBMAEModule
 from se3_transformer.model.mae import base_MAE, egnn_MAE
 from se3_transformer.model.fiber import Fiber
 from se3_transformer.runtime import gpu_affinity
 from se3_transformer.runtime.arguments import PARSER
-from se3_transformer.runtime.callbacks import QM9MetricCallback, QM9LRSchedulerCallback, BaseCallback, \
+from se3_transformer.runtime.callbacks import PretrainLossCallback, QM9MetricCallback, QM9LRSchedulerCallback, BaseCallback, \
     PerformanceCallback
 from se3_transformer.runtime.loggers import LoggerCollection, DLLogger, WandbLogger, Logger
 from se3_transformer.runtime.utils import to_cuda, get_local_rank, init_distributed, seed_everything, \
@@ -75,18 +76,20 @@ def train(model: nn.Module,
         if isinstance(train_dataloader.sampler, DistributedSampler):
             train_dataloader.sampler.set_epoch(epoch_idx)
 
-        loss = train_epoch(model, train_dataloader, loss_fn, epoch_idx, grad_scaler, optimizer, local_rank, callbacks,
+        loss_dict = train_epoch(model, train_dataloader, loss_fn, epoch_idx, grad_scaler, optimizer, local_rank, callbacks,
                            args)
         if dist.is_initialized():
-            loss = torch.tensor(loss, dtype=torch.float, device=device)
-            torch.distributed.all_reduce(loss)
-            loss = (loss / world_size).item()
+            for k, v in loss_dict.items():
+                v = torch.tensor(v, dtype=torch.float, device=device)
+                torch.distributed.all_reduce(v)
+                loss_dict[k] = (v / world_size).item()
 
-        logging.info(f'Train loss: {loss}')
-        logger.log_metrics({'train loss': loss}, epoch_idx)
+        for k, v in loss_dict.items():
+            logging.info(f'{k}: {v}')
+            logger.log_metrics({k: v}, epoch_idx)
 
         if epoch_idx + 1 == args.epochs:
-            logger.log_metrics({'train loss': loss})
+            logger.log_metrics({'train loss': loss_dict['train_loss']})
 
         for callback in callbacks:
             callback.on_epoch_end()
@@ -111,11 +114,14 @@ def train(model: nn.Module,
 
 
 def train_epoch(model, train_dataloader, loss_fn, epoch_idx, grad_scaler, optimizer, local_rank, callbacks, args):
-    losses = []
+    loss_logger = []
+    length_loss_logger = []
+    angle_loss_logger = []
     for i, batch in tqdm(enumerate(train_dataloader), total=len(train_dataloader), unit='batch',
                          desc=f'Epoch {epoch_idx}', disable=(args.silent or local_rank != 0)):
         # *inputs, target = to_cuda(batch)
-        *inputs, _, bond_length_truth, bond_angle_truth = to_cuda(batch)
+
+        *inputs, _, pretrain_labels = to_cuda(batch)
         batched_graph = inputs[0]
 
         for callback in callbacks:
@@ -123,13 +129,16 @@ def train_epoch(model, train_dataloader, loss_fn, epoch_idx, grad_scaler, optimi
 
         with torch.cuda.amp.autocast(enabled=args.amp):
             # bond_length_pred, bond_angle_pred, radius_pred, orientaion_pred
-            preds = model(*inputs)
-            length_loss = loss_fn(preds[0][~batched_graph.ndata['node_mask'].bool()], bond_length_truth[~batched_graph.ndata['node_mask'].bool()])
-            angle_loss = von_Mises_loss(preds[1][~batched_graph.ndata['node_mask'].bool()], bond_angle_truth[~batched_graph.ndata['node_mask'].bool()])
+            preds = model(*inputs, pretrain_labels=pretrain_labels)
+            res_mask = pretrain_labels['batch_neighbor_masks'][~batched_graph.ndata['node_mask'].bool().cpu()]
+            length_loss = loss_fn((preds[0] * pretrain_labels['batch_neighbor_masks'].cpu())[~batched_graph.ndata['node_mask'].bool().cpu()],
+                                  (pretrain_labels['bond_length'].cpu() * pretrain_labels['batch_neighbor_masks'].cpu())[~batched_graph.ndata['node_mask'].bool().cpu()])
+            angle_loss = torch.sum(von_Mises_loss((preds[1] * pretrain_labels['batch_angle_masks'].cpu())[~batched_graph.ndata['node_mask'].bool().cpu()],   \
+                                    (pretrain_labels['bond_angle'].cpu() * pretrain_labels['batch_angle_masks'].cpu())[~batched_graph.ndata['node_mask'].bool().cpu()])) \
+                                        /((~batched_graph.ndata['node_mask'].bool()).sum(dim=-1) + 1e-10)
             # radius_loss = loss_fn(preds[2]*batched_graph.ndata['node_mask'])
-            # orientation_loss = loss_fn(preds[2]*batched_graph.ndata['node_mask'])
-
-            loss = (length_loss + angle_loss) / args.accumulate_grad_batches
+            # orientation_loss = loss_fn(preds[3]*batched_graph.ndata['node_mask'])
+            loss = (length_loss - 0.5 * angle_loss) / args.accumulate_grad_batches
 
         grad_scaler.scale(loss).backward()
 
@@ -143,9 +152,13 @@ def train_epoch(model, train_dataloader, loss_fn, epoch_idx, grad_scaler, optimi
             grad_scaler.update()
             model.zero_grad(set_to_none=True)
 
-        losses.append(loss.item())
+        loss_logger.append(loss.item())
+        length_loss_logger.append(length_loss.item())
+        angle_loss_logger.append(angle_loss.item())
 
-    return np.mean(losses)
+    return {"train_loss":np.mean(loss_logger), 
+            "length_loss":np.mean(length_loss_logger), 
+            "angle_loss":np.mean(angle_loss_logger)}
 
 
 @torch.inference_mode()
@@ -158,28 +171,34 @@ def validate(model: nn.Module,
     model.eval()
     for i, batch in tqdm(enumerate(dataloader), total=len(dataloader), unit='batch', desc=f'Evaluation',
                          leave=False, disable=(args.silent or get_local_rank() != 0)):
-        *input, _ = to_cuda(batch)
+        *inputs, _, pretrain_labels = to_cuda(batch)
+        batched_graph = inputs[0]
 
         for callback in callbacks:
             callback.on_batch_start()
 
         with torch.cuda.amp.autocast(enabled=args.amp):
-            target, recon = model(*input)
+            preds = model(*inputs, pretrain_labels=pretrain_labels)
+            length_loss = loss_fn(preds[0][~batched_graph.ndata['node_mask'].bool().cpu()], pretrain_labels['bond_length'].cpu()[~batched_graph.ndata['node_mask'].bool().cpu()])
+            angle_loss = torch.sum(von_Mises_loss(preds[1][~batched_graph.ndata['node_mask'].bool().cpu()], pretrain_labels['bond_angle'].cpu()[~batched_graph.ndata['node_mask'].bool().cpu()])) \
+                / ((~batched_graph.ndata['node_mask'].bool()).sum(dim=-1) + 1e-10)
+            # radius_loss = loss_fn(preds[2]*batched_graph.ndata['node_mask'])
+            # orientation_loss = loss_fn(preds[2]*batched_graph.ndata['node_mask'])
+            loss = (length_loss - angle_loss) / args.accumulate_grad_batches
 
             for callback in callbacks:
-                callback.on_validation_step(input, recon, target)
+                callback.on_validation_step(loss)
+
+
 
 
 if __name__ == '__main__':
     is_distributed = init_distributed()
     local_rank = get_local_rank()
-    # base_MAE.add_argparse_args(PARSER)
-    PARSER.add_argument('--mask_ratio', type=float, default=0.3, help="The mask ratio of the masked auto-encoder.")
-    PARSER.add_argument('--mask_type', choices=['rand', 'block'], default='rand', help='The mask strategy on atoms, rand or block.')
-    PARSER.add_argument('--mask_all', type=str2bool, default=False, help='If true, mask basis, node features and edge features. If false, only mask node features, may have data leakge')
-    PARSER.add_argument('--prepare_pretrain', type=str2bool, default=True, help='prepare labels for pretraining tasks')
     args = PARSER.parse_args()
 
+    lg = RDLogger.logger()
+    lg.setLevel(RDLogger.CRITICAL)
     logging.getLogger().setLevel(logging.CRITICAL if local_rank != 0 or args.silent else logging.INFO)
 
     logging.info('========== SE(3)-MAE ==========')
@@ -192,10 +211,12 @@ if __name__ == '__main__':
 
     loggers = [DLLogger(save_dir=args.log_dir, filename=args.dllogger_name)]
     if args.wandb:
-        loggers.append(WandbLogger(name=args.exp_name, save_dir=args.log_dir, project='se3-mae'))
+        loggers.append(WandbLogger(name=args.exp_name, save_dir=args.log_dir, project='se3-eva'))
     logger = LoggerCollection(loggers)
 
-    datamodule = QM9MAEModule(**vars(args))
+    # datamodule = QM9MAEModule(**vars(args))
+    datamodule = OGBMAEModule(**vars(args))
+
     if args.encoder_type == 'se3':
         model = base_MAE(
             fiber_in=Fiber({0: datamodule.NODE_FEATURE_DIM}),
@@ -236,7 +257,7 @@ if __name__ == '__main__':
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         callbacks = [PerformanceCallback(logger, args.batch_size * world_size)]
     else:
-        callbacks = [QM9MetricCallback(logger, targets_std=datamodule.targets_std, prefix='validation'),
+        callbacks = [PretrainLossCallback(logger, prefix='validation'),
                      QM9LRSchedulerCallback(logger, epochs=args.epochs)]
 
     if is_distributed:

@@ -24,7 +24,7 @@
 import argparse
 import pathlib
 
-from se3_transformer.data_loading import QM9DataModule
+from se3_transformer.data_loading import QM9DataModule, QM9MAEModule
 from se3_transformer.model import SE3Transformer
 from se3_transformer.runtime.utils import str2bool
 
@@ -76,5 +76,11 @@ PARSER.add_argument('--loss_type', type=str, default='sce', help='The optimizati
 PARSER.add_argument('--local_rank', type=int, default=0)
 PARSER.add_argument('--encoder_type', type=str, choices=['egnn', 'se3'], default='se3', help='The backbone model of the encoder.')
 
-QM9DataModule.add_argparse_args(PARSER)
+QM9MAEModule.add_argparse_args(PARSER)
+
+PARSER.add_argument('--mask_ratio', type=float, default=0.1, help="The mask ratio of the masked auto-encoder.")
+PARSER.add_argument('--mask_type', choices=['rand', 'block'], default='rand', help='The mask strategy on atoms, rand or block.')
+PARSER.add_argument('--mask_all', type=str2bool, default=False, help='If true, mask basis, node features and edge features. If false, only mask node features, may have data leakge')
+PARSER.add_argument('--prepare_pretrain', type=str2bool, default=True, help='prepare labels for pretraining tasks')
+
 SE3Transformer.add_argparse_args(PARSER)

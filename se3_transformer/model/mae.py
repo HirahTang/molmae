@@ -1,3 +1,4 @@
+from email.policy import default
 import logging
 
 
@@ -6,6 +7,7 @@ from re import X
 from secrets import choice
 from turtle import forward
 from typing import Optional, Literal, Dict
+from se3_transformer.model.fiber import FiberEl
 from sympy import false
 import math
 import copy
@@ -23,6 +25,9 @@ from se3_transformer.model.basis import get_basis, update_basis_with_fused
 from se3_transformer.model.transformer import get_populated_edge_features
 from se3_transformer.model.layers.convolution import ConvSE3FuseLevel
 from se3_transformer.model.layers.pooling import GPooling
+from se3_transformer.model.layers.linear import LinearSE3
+from se3_transformer.data_loading.qm9 import _get_relative_pos
+from se3_transformer.run_mae.utils import ground_truth_local_stats
 
 
 
@@ -74,36 +79,13 @@ class base_MAE(nn.Module):
             # Fully fused convolutions when using Tensor Cores (and not low memory mode)
             self.fuse_level = ConvSE3FuseLevel.FULL if tensor_cores else ConvSE3FuseLevel.PARTIAL
 
-        output_dim=1
-        output_dim_node = fiber_out.channels[0]
-        output_dim_pos = fiber_out.channels[1]
-        self.bond_length_head = nn.Sequential(
-            nn.Linear(output_dim_node, output_dim_node),
-            nn.ReLU(),
-            nn.Linear(output_dim_node, 4)
-        )
-        self.bond_angle_head = nn.Sequential(
-            nn.Linear(output_dim_node, output_dim_node),
-            nn.ReLU(),
-            nn.Linear(output_dim_node, 6)
-        )
-        self.orientation_head = nn.Sequential(
-            nn.Linear(output_dim_node, output_dim_node),
-            nn.ReLU(),
-            nn.Linear(output_dim_node, 1)
-        )
-        self.radius_head = nn.Sequential(
-            nn.Linear(output_dim_node, output_dim_node),
-            nn.ReLU(),
-            nn.Linear(output_dim_node, 1)
-        )
-
         self.pooling_module = GPooling(pool='avg', feat_type=0)
+        final_fiber = default(fiber_out, fiber_hidden)
 
-        self.mask_ratio = kwargs['mask_ratio']
-        self.mask_type = kwargs['mask_type']
-        self.mask_all = kwargs['mask_all']
-
+        self.linear_out = LinearSE3(
+            final_fiber,
+            Fiber(list(map(lambda t: FiberEl(degree = t[0], channels = 1), final_fiber)))
+        )
 
     @staticmethod
     def is_node_masked(edges):
@@ -113,11 +95,8 @@ class base_MAE(nn.Module):
     def forward(self, graph: DGLGraph, node_feats: Dict[str, Tensor], 
                 edge_feats: Optional[Dict[str, Tensor]] = None, 
                 basis: Optional[Dict[str, Tensor]] = None,
-                ):
-        # mask non-terminal node
-        # node_feats_masked, edge_feats_masked = self.mask_features(graph, node_feats, edge_feats)
-        node_feats_masked, edge_feats_masked = self.mask_features(graph, node_feats, edge_feats)
-        
+                pretrain_labels=None,
+                ):        
         # Compute bases if they weren't precomputed as part of the data loading
         basis = basis or get_basis(graph.edata['rel_pos'], max_degree=self.max_degree, compute_gradients=False,
                                    use_pad_trick=self.tensor_cores and not self.low_memory,
@@ -125,25 +104,25 @@ class base_MAE(nn.Module):
         # add fused bases (per output degree, per input degree, and fully fused) to the dict
         basis = update_basis_with_fused(basis, self.max_degree, use_pad_trick=self.tensor_cores and self.low_memory, fully_fused=self.fuse_level == ConvSE3FuseLevel.FULL)
 
-        edge_feats_masked = get_populated_edge_features(graph.edata['rel_pos'], edge_feats_masked)
+        edge_feats = get_populated_edge_features(graph.edata['rel_pos'], edge_feats)
         
-        # return type '0', '1'
-        embedding = self.transformer.graph_modules(node_feats_masked, edge_feats_masked, graph=graph, basis=basis)
-        embedding_node, coord_pred = embedding['0'].squeeze(-1), embedding['1']
-        embedding_mol = self.pooling_module(embedding, graph=graph) 
+        embedding = self.transformer.graph_modules(node_feats, edge_feats, graph=graph, basis=basis)
+        pred_coord = self.linear_out(embedding)
+        pred_coord = map_values(lambda t: t.squeeze(dim=1), pred_coord)
 
-        bond_length_pred = self.bond_length_head(embedding_node)
-        bond_angle_pred = self.bond_angle_head(embedding_node)
-        radius_pred = self.radius_head(embedding_node)
+        # embedding_node = embedding['0'].squeeze(-1)
+        # embedding_mol = self.pooling_module(embedding, graph=graph) 
 
-        orientation_pred = self.orientation_head(embedding_mol)
+        bond_length_pred, bond_angle_pred, _ = ground_truth_local_stats(pos=pred_coord['1'], neighbors=pretrain_labels['neighbors'], neighbor_mask=pretrain_labels['neighbor_masks'])
+        # radius_pred = self.radius_head(embedding_node)
+
+        # orientation_pred = self.orientation_head(embedding_mol)
 
         # node_feats = self.graph_module(node_feats, edge_feats, graph=graph, basis=basis)
         # return node_feats['0'].squeeze()[~node_mask_booled], node_feats_recon[~node_mask_booled]
         # node_gt = torch.concat([graph.ndata['pos'], node_feats['0'].squeeze()], dim=-1)
         # edge_gt = torch.concat([graph.edata['pos'], node_feats['0'].squeeze()], dim=-1)
-
-        return (bond_length_pred, bond_angle_pred, radius_pred, orientation_pred)
+        return (bond_length_pred, bond_angle_pred)#, radius_pred, orientation_pred)
 
 
     def embed(self, graph, node_feats, edge_feats, basis=None):
@@ -159,85 +138,8 @@ class base_MAE(nn.Module):
 
     @staticmethod
     def add_argparse_args(parser):
-        # arguments added for mask
-
-        parser.add_argument('--mask_ratio', type=float, default=0.3, help="The mask ratio of the masked auto-encoder.")
-        parser.add_argument('--mask_type', choices=['rand', 'block'], default='rand', help='The mask strategy on atoms, rand or block.')
-        parser.add_argument('--mask_all', type=str2bool, default=False, help='If true, mask basis, node features and edge features. If false, only mask node features, may have data leakge')
-
         return parser
-        
-    def mask_features(self, graph, node_feats, edge_feats):
-        num_node = node_feats['0'].shape[0]
-        num_edge = edge_feats['0'].shape[0]
-        # basis_c = copy.deepcopy(basis)
-        node_feats_c = copy.deepcopy(node_feats)
-        edge_feats_c = copy.deepcopy(edge_feats)
-
-        if self.mask_type == 'rand':
-            # node_mask_booled, edge_mask_booled = self._mask_pos_rand(graph, num_node, num_edge)
-            self._mask_pos_rand(graph, num_node, num_edge)
-        elif self.mask_type == 'block':
-            node_mask_booled, edge_mask_booled = self._mask_pos_block(graph, num_node, num_edge)
-        else:
-            raise NotImplementedError
-
-        if self.mask_all:
-            # mask node features, and edge features
-            n_f = node_feats_c['0'].squeeze()
-            n_m = graph.ndata['node_mask'].unsqueeze(-1).repeat(1,6)
-            node_feats_c['0'] = torch.mul(n_f, n_m).unsqueeze(-1)
-            
-            e_f = edge_feats_c['0'].squeeze()
-            e_m = graph.edata['edge_mask'].unsqueeze(-1).repeat(1,4)
-            edge_feats_c['0'] = torch.mul(e_f, e_m).unsqueeze(-1)
-            # drop edge
-            
-            return  node_feats_c, edge_feats_c
-
-        else:
-            # mask node features only
-            n_f = node_feats_c['0'].squeeze()
-            n_m = node_mask_booled.to(torch.int).unsqueeze(-1).repeat(1,6)
-            node_feats_c['0'] = torch.mul(n_f, n_m).unsqueeze(-1)
-            
-            return  node_feats_c, edge_feats_c
-
-    def _mask_pos_rand(self, graph, num_node, num_edge, noaug=False):
-        n_atoms_per_mol = graph.batch_num_nodes()
-        n_edges_per_mol = graph.batch_num_edges()
-
-        graph.ndata['node_mask'] = torch.ones(num_node, device=graph.device)
-        graph.edata['edge_mask'] = torch.ones(num_edge, device=graph.device)
-
-        if self.mask_all:
-            # besides node features, mask basis and edge features as well
-            n_atoms_prev_mol = 0
-            for n in n_atoms_per_mol:
-                n_mask = math.ceil(n * self.mask_ratio)
-                perm = torch.randperm(n, device=graph.device) 
-                graph.ndata['node_mask'][perm[:n_mask]+n_atoms_prev_mol] = 0
-                n_atoms_prev_mol += n
-
-            masked_edges_id = graph.filter_edges(self.is_node_masked)
-            # masked_edges = graph.find_edges(masked_edges_id)
-            graph.edata['edge_mask'][masked_edges_id] = 0
-
-
-        else:
-            n_atoms_prev_mol = 0
-            for n in n_atoms_per_mol:
-                n_mask = math.ceil(n * self.mask_ratio)
-                perm = torch.randperm(n, device=graph.device)
-                graph.ndata['node_mask'][perm[:n_mask]+n_atoms_prev_mol] = False
-                n_atoms_prev_mol += n
-                
-            # return node_mask_booled, edge_mask_booled
-
-
-    def _mask_pos_block(self, graph, num_node, num_edge, noaug=False):
-        pass
-
+    
 
 ## Transformers
 class Mlp(nn.Module):
@@ -447,7 +349,7 @@ class egnn_MAE(nn.Module):
 
 
 
-# pred = self.egnn(x=x_egnn, edge_index=edge_index, edge_attr=edge_attr_stoch, batch=batch)
+        # pred = self.egnn(x=x_egnn, edge_index=edge_index, edge_attr=edge_attr_stoch, batch=batch)
 
         node_feats_recon = self.transformer.graph_modules(node_feats_masked, edge_feats_masked, graph=graph, basis=basis)
         # node_feats = self.graph_module(node_feats, edge_feats, graph=graph, basis=basis)
@@ -502,4 +404,12 @@ class egnn_MAE(nn.Module):
         return  node_feats_c
 
 
-    
+def map_values(fn, d):
+    return {k: fn(v) for k, v in d.items()}
+
+
+def default(val, d):
+    if val is not None:
+        return val
+    else:
+        return d

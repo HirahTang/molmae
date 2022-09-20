@@ -27,14 +27,16 @@ def assign_neighborhoods(graph) -> None:
     neighbors = {}
     for node in graph.nodes():
         out_edges = graph.out_edges(node)[1]
-        if out_edges.shape[0] > 0:
+        if out_edges.shape[0] > 1:
             neighbors[int(node)] = out_edges
+        
 
     n_neighborhoods = len(neighbors)
     
     # mask for neighbors, not all nodes have 4 neighbors
     # 4 works for qm9, may cause bug for drug dataset
     neighbor_masks = torch.zeros([n_neighborhoods, 4])
+    batch_neighbor_masks = torch.zeros([len(graph.nodes()), 4])
 
     # # maps node index to hidden index as given by self.neighbors
     # x_to_h_map = torch.zeros(x.size(0))
@@ -45,25 +47,34 @@ def assign_neighborhoods(graph) -> None:
     for i, (a, n) in enumerate(neighbors.items()):
         # x_to_h_map[a] = i
         neighbor_masks[i, 0:len(n)] = 1
+        batch_neighbor_masks[a, 0:len(n)] = 1
         neighborhood_to_mol_map[i] = batch[a]
 
-    return neighbors, neighbor_masks
+    return neighbors, neighbor_masks, batch_neighbor_masks, neighborhood_to_mol_map
 
 
 def ground_truth_local_stats(pos, neighbors, neighbor_mask):
     n_neighborhoods = len(neighbors)
+    # consider four neighbors at most
     local_coords = torch.zeros(n_neighborhoods, 4, 3)
     for i, (a, n) in enumerate(neighbors.items()):
-        local_coords[i, 0:len(n)] = pos[n] - pos[a]
-    
-    bond_lengths, bond_angles = batch_local_stats_from_coords(local_coords, neighbor_mask)
-    return bond_lengths, bond_angles
+            local_coords[i, 0:min(len(n),4)] = (pos[n] - pos[a])[:min(len(n), 4)]
+
+    bond_lengths_, bond_angles_, angle_masks_ = batch_local_stats_from_coords(local_coords, neighbor_mask)
+    bond_lengths = torch.zeros([len(pos), 4])
+    bond_angles = torch.zeros([len(pos), 6])
+    angle_masks = torch.zeros([len(pos), 6])
+    for i, node in enumerate(neighbors.keys()):
+        bond_lengths[node] = bond_lengths_[i]
+        bond_angles[node] = bond_angles_[i]
+        angle_masks[node] = angle_masks_[i] 
+    return bond_lengths, bond_angles, angle_masks
 
 
 def batch_local_stats_from_coords(local_coords, neighbor_mask):
     one_hop_ds = torch.linalg.norm(torch.zeros_like(local_coords[0]).unsqueeze(0) - local_coords, dim=-1)
-    angles = batch_angles_from_coords(local_coords, neighbor_mask)
-    return one_hop_ds, angles
+    angles, angle_mask = batch_angles_from_coords(local_coords, neighbor_mask)
+    return one_hop_ds, angles, angle_mask
 
 
 def batch_angles_from_coords(coords, mask):
@@ -83,7 +94,7 @@ def batch_angles_from_coords(coords, mask):
     v_a, v_b = all_possible_combos.split(1, dim=2)
     angle_mask = angle_mask_ref[mask.sum(dim=1).long()]
     angles = batch_angle_between_vectors(v_a.squeeze(2), v_b.squeeze(2)) * angle_mask
-    return angles
+    return angles, angle_mask
 
 
 def batch_angle_between_vectors(a, b):
